@@ -16,3 +16,13 @@ pip install -r requirements.txt
 ```
 
 To generate gifs for visualization, [ImageMagick](https://imagemagick.org/index.php) must be installed.
+
+## Running Code
+
+To visualize the decision boundaries of a CIFAR-10 classifier, run the following command:
+
+```bash
+python vis_model.py --model_path <path_to_model> --save_path <path_to_save>
+```
+
+If you don't have a model handy, the code with train one for you. check ``fetch_args()`` in ``vis_model.py`` for more options related to visualization options.
