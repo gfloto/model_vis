@@ -1,151 +1,172 @@
-import os, sys, argparse, torch, re
+import argparse
+from tqdm import tqdm
+from functools import partial
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib import colormaps
-from einops import rearrange, repeat
-from PIL import Image
+import torch 
+import torchvision
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 
-from model import CrappyNet
-from dataload import Dataloader, gen_dataset, load_iid, load_ood
+from plotting import make_gif
 
-# sorts keys according to alpha numeric
-def natural_key(string_):
-    return [int(s) if s.isdigit() else s for s in re.split(r'(\d+)', string_)]
-
-# saves images into a gif
-def gif_save(path, name):
-    pull_path = os.path.join(path)
-    ims = os.listdir(pull_path)   
-    ims = sorted(ims, key=natural_key)
-
-    # read files
-    video = []
-    for i, f in enumerate(ims):
-        file = os.path.join(pull_path, f)
-        frame = Image.open(file)
-        video.append(frame)
-        
-
-    # save gif
-    save_path = os.path.join(path, '..', name+'.gif') 
-    video[0].save(save_path, format='gif',
-                   append_images=video[1:],
-                   save_all=True,
-                   duration=60, loop=0)   
-    return
-
-# get on image from each class
-def pick_data(x, y, n_classes=10):
-    s = x.shape
-    out = torch.empty((n_classes, *s[1:]))
-    for i in range(n_classes):
-        opt = torch.where(y == i)[0] # all inds where class is i
-        ind = np.random.randint(opt.shape[0]) # select a random one
-        out[i] = x[opt[ind]]
-    return out
-
-# return batch of images based on x 
-# this function makes rows for the visualization
-def make_row(x, r, v1, v2, w, eps, device):
-    eps_vec = torch.zeros(w+1, *x.shape).to(device)
-    for i in range(w+1): # this is slow
-        q1 = eps * (i - w//2) * v1
-        q2 = eps * (r - w//2) * v2
-        eps_vec[i,:,:,:] = q1 + q2 
-    x = repeat(x, 'c h w -> k c h w', k=w+1)
-    return x + eps_vec
-
-def norm(x):
-    return x / torch.linalg.norm(x)
-
-# select model to load
-def get_args():
+def fetch_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-name', default=None, type=str, help='name of experiment (will load that model)')
+    parser.add_argument('--model_path', default=None, type=str, help='path of torch classifier to load')
+    parser.add_argument('--batch_size', default=64, type=int)
+    parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--n_frames', default=100, type=int, help='number of frames in gif')
+    parser.add_argument('--grid_size', default=1e-6, type=float, help='total size of grid range in image-space')
+    parser.add_argument('--grid_samples', default=128, type=int, help='numer of samples to make grid height / width (output image size)')
+    parser.add_argument('--save_path', default='output.gif', type=str, help='path to save gif')
+
     return parser.parse_args()
 
-if __name__ == '__main__':
-    # get args and perform checks
-    args = get_args()
-    assert args.name is not None
+def load_model(model_path):
+    if model_path is None:
+        print('no model path provided, using default swin-t model')
 
-    # load model
-    path = os.path.join('results', args.name)
-    model = torch.load(os.path.join(path, 'best_ood', 'model_ood.pt'))
+        # modify last layer to output 10 classes
+        # (for visualization clarity...)
+        model = torchvision.models.swin_t()
+        model.head = torch.nn.Linear(model.head.in_features, 10)
+    else:
+        print(f'loading model from {model_path}')
+        model = torch.load(model_path)
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu') 
-    print('using: ', device)
+    return model
 
-    # load data
-    data_path = 'data/mnist/'
-    x_ood, y_ood = load_ood(data_path, device)
+def fetch_loader(batch_size, num_workers, split):
+    print('fetching cifar-10 dataset')
 
-    # push to device
-    model = model.to(device)
+    train = split == 'train'
+    partial_dataset = partial(
+        datasets.CIFAR10, root='./data',
+        train=train, transform=transforms.ToTensor(),
+    )
 
-    # settings for vis
-    w = 400 # width of window
-    q = np.sqrt(28**2)
-    eps = 2 * q/w # diff per change in pixel
-    print(eps)
+    try: dataset = partial_dataset(download=False)
+    except: dataset = partial_dataset(download=True)
 
-    path = os.path.join(path, 'imgs')
-    os.makedirs(path, exist_ok=True)
-        
-    # main video gen loop
-    c_ = 4
-    while True:
-        ind = np.random.randint(x_ood.shape[0])
-        x = x_ood[ind,:,:,:]
-        y = model(x).argmax().item()
-        print(y)
-        if y == c_: break
+    loader = DataLoader(
+        dataset, batch_size=batch_size,
+        shuffle=True, num_workers=num_workers,
+    )
 
-    # sample initial hyper-plane vectors
-    s = np.prod([a for a in x.shape])
-    a = torch.randn(s)
-    b = torch.randn(s)
+    return loader
 
-    # make orthogonal and normalize
-    a0 = norm(a)
-    b0 = norm(b)
+# train swin on cifar-10 for a bit...
+def train_swin(model, loader, n_epochs=10):
+    print('training swin-t model on cifar-10')
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    loss_fn = torch.nn.CrossEntropyLoss()
 
-    # sample frequency vectors
-    c = 2*np.pi * torch.rand(2, s)
+    for epoch in range(n_epochs):
+        loss_track = []
+
+        for x, y in tqdm(loader):
+            x = x.cuda(); y = y.cuda() 
+
+            pred = model(x)
+            loss = loss_fn(pred, y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            loss_track.append(loss.item())
+
+        # save model
+        print(f'average loss: {np.mean(loss_track):.5f}')
+        print(f'saving model')
+        torch.save(model, f'swin_t.pt')
+
+    return model
+
+# orthonormalize the 2 vectors defining the hyperplane
+# using gram-schmidt: (https://en.wikipedia.org/wiki/Gram-Schmidt_process)
+def orthonormalize(v):
+    v1, v2 = v
+    v1 = v1 / torch.linalg.norm(v1)
+    #v2 -= torch.einsum('c h w, c h w -> ', v1, v2) * v1
+    v2 = v2 / torch.linalg.norm(v2)
+    return torch.stack([v1, v2])
+
+# NOTE: this is slow... too bad!!
+# sample square grid of images on the hyperplane, spaced by eps
+def make_grid(x, v, grid_size, grid_samples):
+    eps = grid_size / grid_samples
+
+    v1, v2 = v
+    shape = (grid_samples, grid_samples, *x.shape[1:])
+    grid = torch.zeros(shape).cuda()
+    for i in range(grid_samples):
+        for j in range(grid_samples):
+            step_1 = (i - grid_samples//2) * eps * v1
+            step_2 = (j - grid_samples//2) * eps * v2
+            grid[i, j] = x + step_1 + step_2
+    return grid
+
+@ torch.no_grad()
+def draw_frames(x, model, n_frames, grid_size, grid_samples):
+    print('making frames...')
+
+    # sample two random vectors in image-space
+    # which define the hyperplane
+    shape = (2, *x.shape[1:])
+    v_init = torch.randn(shape).cuda()
     
-    # for images
-    x_input = torch.empty((w+1, w+1, *x.shape))
-    img = torch.zeros((w+1, w+1))
+    # sample a vector which defines the rotation
+    c = 2 * np.pi * torch.rand(shape).cuda()
 
-    # main video gen
-    patches = 4
-    mod_k = (w+1) // patches
-    T = np.linspace(0, 2*np.pi, 100)
-    for i, t in enumerate(T):
-        img, x_patch = None, None
-        a = torch.sin(t + c[0]) + a0 
-        b = torch.sin(t + c[1]) + b0 
-        a = norm(a)
-        b = norm(b)
-        
-        # make image loop
-        for j in range(w+1): # center pixel to be initial guess
-            x_row = make_row(x, j, a.view(*x.shape), b.view(*x.shape), w, eps, device)
-            x_patch = torch.cat((x_patch, x_row)) if x_patch is not None else x_row 
+    # main loop to draw frames in gif
+    frames = []
+    T = np.linspace(0, np.pi, n_frames)
 
-            if j % mod_k == 0 and j != 0 or j == w:
-                out = model(x_patch).exp()
-                out = out.argmax(dim=1).cpu()
-                img = torch.cat((img, out)) if img is not None else out
-                x_patch = None
-        img = img.view((w+1, w+1))
+    for i, t in enumerate(tqdm(T)):
+        # rotate the hyperplane
+        v = torch.sin(t * c) + v_init
+        v = orthonormalize(v)
 
-        # plot
-        plt.imshow(img, vmin=0, vmax=9, cmap=colormaps['terrain'])
-        plt.axis('off')
-        plt.colorbar()
-        plt.savefig(os.path.join(path, 'vis_{}.png'.format(i)))
-        plt.close()
+        # sample grid of images on the hyperplane
+        x_grid = make_grid(x, v, grid_size, grid_samples) 
 
-    gif_save(os.path.join(path), 'class_{}'.format(c_))
+        # batch forward pass by rows
+        y_out = []
+        for i in range(x_grid.shape[0]):
+            y = model(x_grid[i]).argmax(dim=-1)
+            y_out.append(y)
+        y = torch.stack(y_out)
 
+        frames.append(y.cpu())
+
+    return torch.stack(frames)
+
+if __name__ == '__main__':
+    args = fetch_args()
+
+    model = load_model(args.model_path).cuda()
+
+    # train swin-t model on cifar-10
+    if args.model_path is None:
+        loader = fetch_loader(args.batch_size, args.num_workers, 'train')
+        model = train_swin(model, loader)
+    
+    loader = fetch_loader(args.batch_size, args.num_workers, 'test')
+
+    # get a single cifar-10 image incorrectly classified by the model
+    # the image is the origin around which we 
+    # will rotate a hyperplane in image-space
+    while True:
+        x, y = next(iter(loader))
+        x = x.cuda(); y = y.cuda()
+
+        pred = model(x).argmax(dim=-1)
+        ids = torch.where(pred != y)[0]
+
+        if len(ids) > 0:
+            x = x[ids[0]][None, ...]
+            break
+
+    # main loop to draw frames for gif
+    frames = draw_frames(x, model, args.n_frames, args.grid_size, args.grid_samples)
+    make_gif(frames, args.save_path)
